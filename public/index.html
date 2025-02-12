@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IPTV Addon Configuration</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 min-h-screen p-4">
+    <div class="max-w-2xl mx-auto bg-white rounded-lg shadow p-6">
+        <h1 class="text-2xl font-bold mb-6">IPTV Addon Configuration</h1>
+        
+        <form id="configForm" class="space-y-4">
+            <div>
+                <label class="block text-sm font-medium mb-1">M3U URL (Required)</label>
+                <input type="url" id="m3uUrl" required
+                    class="w-full p-2 border rounded focus:ring-2 focus:ring-blue-500"
+                    placeholder="https://example.com/playlist.m3u">
+            </div>
+            
+            <div>
+                <label class="block text-sm font-medium mb-1">EPG URL (Optional)</label>
+                <input type="url" id="epgUrl"
+                    class="w-full p-2 border rounded focus:ring-2 focus:ring-blue-500"
+                    placeholder="https://example.com/epg.xml">
+            </div>
+            
+            <div>
+                <label class="block text-sm font-medium mb-1">Addon Name</label>
+                <input type="text" id="name"
+                    class="w-full p-2 border rounded focus:ring-2 focus:ring-blue-500"
+                    placeholder="My IPTV Addon">
+            </div>
+            
+            <div>
+                <label class="block text-sm font-medium mb-1">Description</label>
+                <textarea id="description"
+                    class="w-full p-2 border rounded focus:ring-2 focus:ring-blue-500"
+                    placeholder="Custom IPTV addon with DRM support"></textarea>
+            </div>
+            
+            <div>
+                <label class="block text-sm font-medium mb-1">Languages (Optional)</label>
+                <div class="space-y-2">
+                    <label class="inline-flex items-center mr-4">
+                        <input type="checkbox" name="languages" value="any" class="mr-2"> Any
+                    </label>
+                    <label class="inline-flex items-center mr-4">
+                        <input type="checkbox" name="languages" value="en" class="mr-2"> English
+                    </label>
+                    <label class="inline-flex items-center mr-4">
+                        <input type="checkbox" name="languages" value="es" class="mr-2"> Spanish
+                    </label>
+                    <label class="inline-flex items-center mr-4">
+                        <input type="checkbox" name="languages" value="fr" class="mr-2"> French
+                    </label>
+                    <label class="inline-flex items-center mr-4">
+                        <input type="checkbox" name="languages" value="de" class="mr-2"> German
+                    </label>
+                    <label class="inline-flex items-center mr-4">
+                        <input type="checkbox" name="languages" value="it" class="mr-2"> Italian
+                    </label>
+                </div>
+            </div>
+            
+            <div>
+                <label class="block text-sm font-medium mb-1">Logo URL (Optional)</label>
+                <input type="url" id="logo"
+                    class="w-full p-2 border rounded focus:ring-2 focus:ring-blue-500"
+                    placeholder="https://example.com/logo.png">
+            </div>
+            
+            <button type="submit"
+                class="w-full bg-blue-500 text-white py-2 px-4 rounded hover:bg-blue-600 focus:ring-2 focus:ring-blue-500">
+                Configure Addon
+            </button>
+        </form>
+        
+        <div id="result" class="mt-6 hidden">
+            <h2 class="text-lg font-semibold mb-2">Configuration Result</h2>
+            <div id="resultContent" class="p-4 rounded"></div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('configForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const resultDiv = document.getElementById('result');
+            const resultContent = document.getElementById('resultContent');
+            
+            try {
+                const languages = Array.from(document.querySelectorAll('input[name="languages"]:checked'))
+                    .map(input => input.value);
+                
+                const response = await fetch('/configure', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        m3uUrl: document.getElementById('m3uUrl').value,
+                        epgUrl: document.getElementById('epgUrl').value,
+                        name: document.getElementById('name').value,
+                        description: document.getElementById('description').value,
+                        languages,
+                        logo: document.getElementById('logo').value
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    resultContent.className = 'p-4 rounded bg-green-100 text-green-700';
+                    resultContent.innerHTML = `
+                        <p class="mb-2">✅ Configuration successful!</p>
+                        <p class="mb-2">To use this addon in Stremio, add the following URL:</p>
+                        <code class="block p-2 bg-gray-100 rounded select-all">${data.addonUrl}</code>
+                        <p class="mt-2 text-sm">Click the URL to select it, then copy and paste in Stremio.</p>
+                    `;
+                } else {
+                    throw new Error(data.error || 'Configuration failed');
+                }
+            } catch (error) {
+                resultContent.className = 'p-4 rounded bg-red-100 text-red-700';
+                resultContent.innerHTML = `❌ Error: ${error.message}`;
+            }
+            
+            resultDiv.classList.remove('hidden');
+        });
+    </script>
+</body>
+</html>
