@@ -36,7 +36,7 @@
                 <label class="block text-sm font-medium mb-1">Description</label>
                 <textarea id="description"
                     class="w-full p-2 border rounded focus:ring-2 focus:ring-blue-500"
-                    placeholder="Custom IPTV addon with DRM support"></textarea>
+                    placeholder="Custom IPTV addon with channel list"></textarea>
             </div>
             
             <div>
@@ -83,51 +83,62 @@
     </div>
 
     <script>
-        document.getElementById('configForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            
-            const resultDiv = document.getElementById('result');
-            const resultContent = document.getElementById('resultContent');
-            
-            try {
-                const languages = Array.from(document.querySelectorAll('input[name="languages"]:checked'))
-                    .map(input => input.value);
-                
-                const response = await fetch('/configure', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        m3uUrl: document.getElementById('m3uUrl').value,
-                        epgUrl: document.getElementById('epgUrl').value,
-                        name: document.getElementById('name').value,
-                        description: document.getElementById('description').value,
-                        languages,
-                        logo: document.getElementById('logo').value
-                    })
-                });
-                
-                const data = await response.json();
-                
-                if (response.ok) {
-                    resultContent.className = 'p-4 rounded bg-green-100 text-green-700';
-                    resultContent.innerHTML = `
-                        <p class="mb-2">✅ Configuration successful!</p>
-                        <p class="mb-2">To use this addon in Stremio, add the following URL:</p>
-                        <code class="block p-2 bg-gray-100 rounded select-all">${data.addonUrl}</code>
-                        <p class="mt-2 text-sm">Click the URL to select it, then copy and paste in Stremio.</p>
-                    `;
-                } else {
-                    throw new Error(data.error || 'Configuration failed');
-                }
-            } catch (error) {
-                resultContent.className = 'p-4 rounded bg-red-100 text-red-700';
-                resultContent.innerHTML = `❌ Error: ${error.message}`;
-            }
-            
-            resultDiv.classList.remove('hidden');
+		document.getElementById('configForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    
+    const resultDiv = document.getElementById('result');
+    const resultContent = document.getElementById('resultContent');
+    
+    try {
+        const languages = Array.from(document.querySelectorAll('input[name="languages"]:checked'))
+            .map(input => input.value);
+        
+        // Create config automatically
+        const requestBody = {
+            m3uUrl: document.getElementById('m3uUrl').value,
+            config: btoa(JSON.stringify({
+                BaseURL: new URL(document.getElementById('m3uUrl').value).origin,
+                name: document.getElementById('name').value || 'IPTV Channels',
+                description: document.getElementById('description').value || 'Custom IPTV Channels'
+            }))
+        };
+
+        // Optional fields
+        if (document.getElementById('epgUrl').value) {
+            requestBody.epgUrl = document.getElementById('epgUrl').value;
+        }
+        if (document.getElementById('logo').value) {
+            requestBody.logo = document.getElementById('logo').value;
+        }
+        
+        const response = await fetch('/configure', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(requestBody)
         });
+        
+        const data = await response.json();
+        
+        if (response.ok) {
+            resultContent.className = 'p-4 rounded bg-green-100 text-green-700';
+            resultContent.innerHTML = `
+                <p class="mb-2">✅ Configuration successful!</p>
+                <p class="mb-2">To use this addon in Stremio, add the following URL:</p>
+                <code class="block p-2 bg-gray-100 rounded select-all">${data.addonUrl}</code>
+                <p class="mt-2 text-sm">Click the URL to select it, then copy and paste in Stremio.</p>
+            `;
+        } else {
+            throw new Error(data.error || 'Configuration failed');
+        }
+    } catch (error) {
+        resultContent.className = 'p-4 rounded bg-red-100 text-red-700';
+        resultContent.innerHTML = `❌ Error: ${error.message}`;
+    }
+    
+    resultDiv.classList.remove('hidden');
+});
     </script>
 </body>
 </html>

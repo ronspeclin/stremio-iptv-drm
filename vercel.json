@@ -1,11 +1,19 @@
 {
     "version": 2,
     "builds": [
-        { "src": "index.js", "use": "@vercel/node" },
-        { "src": "public/**", "use": "@vercel/static" }
+      { "src": "index.js", "use": "@vercel/node" },
+      { "src": "public/**", "use": "@vercel/static" }
     ],
     "routes": [
-        { "src": "/public/(.*)", "dest": "/public/$1" },
-        { "src": "/(.*)", "dest": "/index.js" }
-    ]
-}
+      { "src": "/public/(.*)", "dest": "/public/$1" },
+      { "src": "/(?<userConf>[^/]+)/manifest\\.json", "dest": "/index.js" },
+      { "src": "/(?<userConf>[^/]+)/catalog/tv/iptv_catalog\\.json", "dest": "/index.js" },
+      { "src": "/(?<userConf>[^/]+)/meta/tv/([^/]+)\\.json", "dest": "/index.js" },
+      { "src": "/(?<userConf>[^/]+)/stream/tv/([^/]+)\\.json", "dest": "/index.js" },
+      { "src": "/configure", "dest": "/index.js" },
+      { "src": "/", "dest": "/index.js" }
+    ],
+    "env": {
+      "NODE_ENV": "production"
+    }
+  }

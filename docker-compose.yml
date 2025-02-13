@@ -1,0 +1,16 @@
+version: '3'
+services:
+  app:
+    build: .
+    ports:
+      - "7665:7665"
+    environment:
+      - DEBUG=${DEBUG}
+      - MEDIAFLOW_SERVER_URL=${MEDIAFLOW_SERVER_URL}
+      - MEDIAFLOW_API_PASSWORD=${MEDIAFLOW_API_PASSWORD}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+    volumes:
+      - .:/app
+      - /app/node_modules

@@ -3,434 +3,558 @@ import cors from 'cors';
 import pkg from 'stremio-addon-sdk';
 import fetch from 'node-fetch';
 import crypto from 'crypto';
-import { XMLParser } from 'fast-xml-parser';
+import { createClient } from '@supabase/supabase-js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
-import http from 'http';
+import logger from './logger.js'; //remove this later
 
 const { addonBuilder, serveHTTP } = pkg;
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// Store user data
-const userConfigs = new Map();
-const userChannels = new Map();
-const userEpgData = new Map();
-const userFavorites = new Map();
-const userCategories = new Map();
-const userLanguages = new Map();
-const userLastAccess = new Map();
-
+// Create Express app
 const app = express();
+
+// Add at the top after creating the Express app// remove later
+if (process.env.DEBUG) {
+    app.use(logger.requestLogger);
+}
+
+// Initialize Supabase client
+const supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_ANON_KEY,
+    {
+        auth: {
+            autoRefreshToken: false,
+            persistSession: false
+        }
+    }
+);
+
+// Utility function to generate consistent user ID
+function generateUserId(config) {
+    return crypto.createHash('md5')
+        .update(JSON.stringify(config))
+        .digest('hex');
+}
+
+// Utility function to parse base64 config
+function parseConfig(base64Config) {
+    try {
+        return JSON.parse(Buffer.from(base64Config, 'base64').toString('utf-8'));
+    } catch (error) {
+        console.error('Config parsing error:', error);
+        return null;
+    }
+}
+
+// Middleware
 app.use(cors());
 app.use(express.json());
-app.use(express.static('public'));
 
-function parseM3UContent(content) {
-    const lines = content.split('\n').map(line => line.trim());
-    const channels = [];
-    let currentChannel = null;
-    let currentProps = {};
-
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        
-        if (line.startsWith('#EXTINF:')) {
-            currentProps = {};
-            
-            const match = line.match(/tvg-id="([^"]*)" tvg-logo="([^"]*)" group-title="([^"]*)",\s*(.+)/);
-            currentChannel = {
-                tvgId: match?.[1] || '',
-                logo: match?.[2] || '',
-                group: match?.[3] || 'No Category',
-                name: match?.[4]?.trim() || line.split(',')[1]?.trim() || 'Unknown Channel',
-                inputStream: {},
-                drmConfig: {}
-            };
-        } 
-        else if (line.startsWith('#KODIPROP:')) {
-            if (!currentChannel) continue;
-            
-            const propLine = line.substring('#KODIPROP:'.length);
-            const [key, value] = propLine.split('=').map(s => s.trim());
-            
-            currentProps[key] = value;
-            
-            if (key === 'inputstream.adaptive.manifest_type') {
-                currentChannel.inputStream.manifestType = value;
-            }
-            else if (key === 'inputstream.adaptive.license_type') {
-                currentChannel.inputStream.licenseType = value;
-            }
-            else if (key === 'inputstream.adaptive.license_key') {
-                currentChannel.inputStream.licenseKey = value;
-            }
-        }
-        else if (line.startsWith('http')) {
-            if (currentChannel) {
-                currentChannel.url = line;
-                currentChannel.id = `iptv_${Buffer.from(line).toString('base64')}`;
-                
-                if (currentChannel.inputStream.licenseType === 'org.w3.clearkey') {
-                    const [keyId, key] = currentChannel.inputStream.licenseKey.split(':');
-                    currentChannel.drmConfig = {
-                        keyId: keyId,
-                        key: key,
-                        manifestType: currentChannel.inputStream.manifestType,
-                        licenseType: currentChannel.inputStream.licenseType
-                    };
-                }
-                
-                currentChannel.properties = currentProps;
-                channels.push({...currentChannel});
-                currentChannel = null;
-                currentProps = {};
-            }
-        }
-    }
-
-    const categories = new Set(channels.map(ch => ch.group));
-    console.log('Parsed channels:', channels.length);
-    if (channels.length > 0) {
-        console.log('Sample channel:', JSON.stringify(channels[0], null, 2));
-    }
-
-    return { channels, categories: Array.from(categories) };
-}
-
-async function loadM3UFile(userId, m3uUrl) {
-    try {
-        console.log(`Attempting to fetch M3U from: ${m3uUrl}`);
-        
-        const response = await fetch(m3uUrl, {
-            headers: {
-                'Accept': '*/*',
-                'User-Agent': 'Stremio-IPTV-Addon'
-            }
-        });
-        
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        
-        const m3uContent = await response.text();
-        console.log('M3U content first 100 chars:', m3uContent.substring(0, 100));
-        
-        if (!m3uContent.includes('#EXTM3U')) {
-            throw new Error('Invalid M3U file format - missing #EXTM3U header');
-        }
-
-        const { channels, categories } = parseM3UContent(m3uContent);
-        
-        if (channels.length === 0) {
-            throw new Error('No channels found in M3U file');
-        }
-
-        userCategories.set(userId, Array.from(categories));
-        userChannels.set(userId, channels);
-        
-        console.log(`Successfully loaded ${channels.length} channels for user ${userId}`);
-        console.log('Categories:', Array.from(categories));
-        
-        return true;
-    } catch (error) {
-        console.error('Detailed error loading M3U:', error);
-        console.error('Error stack:', error.stack);
-        return false;
-    }
-}
-
-async function loadEPGData(userId, epgUrl) {
-    if (!epgUrl) return false;
-    
-    try {
-        const response = await fetch(epgUrl);
-        let xmlData = await response.text();
-
-        const parser = new XMLParser({
-            ignoreAttributes: false,
-            attributeNamePrefix: "_"
-        });
-        
-        const epg = parser.parse(xmlData);
-        const programmes = epg.tv.programme;
-        
-        // Organize EPG data by channel
-        const channelPrograms = new Map();
-        if (Array.isArray(programmes)) {
-            programmes.forEach(program => {
-                const channelId = program._channel;
-                if (!channelPrograms.has(channelId)) {
-                    channelPrograms.set(channelId, []);
-                }
-                channelPrograms.get(channelId).push({
-                    start: program._start,
-                    stop: program._stop,
-                    title: program.title,
-                    desc: program.desc,
-                    category: program.category
-                });
-            });
-        }
-        
-        userEpgData.set(userId, channelPrograms);
-        return true;
-    } catch (error) {
-        console.error(`Error loading EPG for user ${userId}:`, error);
-        return false;
-    }
-}
-
+// Configure endpoint
+// Modify the configure endpoint
 app.post('/configure', async (req, res) => {
-    const { m3uUrl, epgUrl, name, description, filterGroups, logo, languages } = req.body;
-    
-    if (!m3uUrl) {
-        return res.status(400).json({ error: 'M3U URL is required' });
-    }
-
     try {
-        const userId = crypto.randomBytes(16).toString('hex');
+        const { m3uUrl, config } = req.body;
         
-        userConfigs.set(userId, {
-            m3uUrl,
-            epgUrl,
-            name: name || 'My IPTV Addon',
-            description: description || 'Custom IPTV addon with DRM support',
-            filterGroups: filterGroups || [],
-            logo: logo || ''
+        if (!m3uUrl || !config) {
+            return res.status(400).json({ error: 'M3U URL and config are required' });
+        }
+
+        // Fetch M3U file
+        const response = await fetch(m3uUrl);
+        if (!response.ok) {
+            return res.status(400).json({ error: 'Failed to fetch M3U file' });
+        }
+
+        const content = await response.text();
+        const parsedConfig = parseConfig(config);
+
+        if (!parsedConfig) {
+            return res.status(400).json({ error: 'Invalid configuration' });
+        }
+
+        const userId = generateUserId(parsedConfig);
+
+        // Parse M3U file
+        const channels = parseM3U(content);
+
+        // Store channels and configuration
+        await supabase.from('channels').upsert({
+            user_id: userId,
+            m3u_url: m3uUrl,
+            base64_config: config,
+            channels: channels, // Use parsed channels
+            updated_at: new Date().toISOString()
         });
 
-        if (languages) {
-            userLanguages.set(userId, new Set(languages));
-        }
+        await supabase.from('addon_config').upsert({
+            user_id: userId,
+            base64_config: config,
+            updated_at: new Date().toISOString()
+        });
 
-        const success = await loadM3UFile(userId, m3uUrl);
-        if (!success) {
-            userConfigs.delete(userId);
-            return res.status(400).json({ 
-                error: 'Failed to load M3U file. Please check if the URL is accessible and contains valid M3U content.',
-                details: 'Check the server logs for more information.'
-            });
-        }
-
-        if (epgUrl) {
-            await loadEPGData(userId, epgUrl);
-        }
+        // Generate addon URL with base64 config in the path
+        const addonUrl = `stremio://${req.get('host')}/${config}/manifest.json`;
 
         res.json({
-            success: true,
-            message: 'Configuration updated',
-            addonUrl: `${req.protocol}://${req.get('host')}/manifest.json?userId=${userId}`
+            userId,
+            addonUrl
         });
     } catch (error) {
         console.error('Configuration error:', error);
-        res.status(500).json({ 
-            error: 'Configuration failed',
-            details: error.message
-        });
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
-app.post('/favorite/:userId/:channelId', (req, res) => {
-    const { userId, channelId } = req.params;
-    const favorites = userFavorites.get(userId) || new Set();
-    favorites.add(channelId);
-    userFavorites.set(userId, favorites);
-    res.json({ success: true });
-});
+// M3U Parser function with comprehensive parsing
+function parseM3U(content) {
+    const channels = [];
+    const lines = content.split('\n');
+    let currentChannel = null;
 
-app.delete('/favorite/:userId/:channelId', (req, res) => {
-    const { userId, channelId } = req.params;
-    const favorites = userFavorites.get(userId) || new Set();
-    favorites.delete(channelId);
-    userFavorites.set(userId, favorites);
-    res.json({ success: true });
-});
+    console.log('Parsing M3U - Total lines:', lines.length);
 
-function createManifest(userId) {
-    const config = userConfigs.get(userId) || {
-        name: 'My IPTV Addon',
-        description: 'Custom IPTV addon with DRM support',
-        logo: ''
-    };
+    for (let i = 0; i < lines.length; i++) {
+        let line = lines[i].trim();
+        
+        if (!line || line === '#EXTM3U') continue;
 
-    const categories = userCategories.get(userId) || [];
-
-    return {
-        id: `org.myiptvaddon.${userId}`,
-        version: '1.0.0',
-        name: config.name,
-        description: config.description,
-        logo: config.logo,
-        resources: ['catalog', 'meta', 'stream'],
-        types: ['tv'],
-        catalogs: [
-            {
-                type: 'tv',
-                id: `iptv_catalog_${userId}`,
-                name: 'All Channels'
-            },
-            {
-                type: 'tv',
-                id: `iptv_favorites_${userId}`,
-                name: '⭐ Favorites'
-            },
-            ...categories.map(category => ({
-                type: 'tv',
-                id: `iptv_category_${category}_${userId}`,
-                name: category
-            }))
-        ],
-        idPrefixes: ['iptv_']
-    };
-}
-
-function getAddonBuilder(userId) {
-    const builder = new addonBuilder(createManifest(userId));
-
-    builder.defineMetaHandler(({ type, id }) => {
-        if (type === 'tv') {
-            const channels = userChannels.get(userId) || [];
-            const channel = channels.find(c => c.id === id);
-            
-            if (!channel) {
-                return Promise.resolve({ meta: null });
-            }
-
-            const meta = {
-                id: channel.id,
-                type: 'tv',
-                name: channel.name,
-                poster: channel.logo,
-                posterShape: 'square',
-                background: channel.logo,
-                logo: channel.logo,
-                description: `${channel.name} - ${channel.group}`
+        if (line.startsWith('#EXTINF:')) {
+            currentChannel = {
+                id: '',
+                name: '',
+                logo: '',
+                group: '',
+                url: '',
+                drm: null
             };
 
-            return Promise.resolve({ meta });
-        }
-        return Promise.resolve({ meta: null });
-    });
-
-    builder.defineCatalogHandler(({ type, id }) => {
-        if (type === 'tv') {
-            const channels = userChannels.get(userId) || [];
-            const epgData = userEpgData.get(userId);
-            const favorites = userFavorites.get(userId) || new Set();
-            const userLangs = userLanguages.get(userId);
-            
-            let filteredChannels = channels;
-
-            if (userLangs && userLangs.size > 0) {
-                filteredChannels = filteredChannels.filter(channel => 
-                    userLangs.has(channel.language) || userLangs.has('any')
-                );
-            }
-            
-            if (id.startsWith('iptv_favorites_')) {
-                filteredChannels = filteredChannels.filter(channel => favorites.has(channel.id));
-            } else if (id.startsWith('iptv_category_')) {
-                const category = id.split('_')[2];
-                filteredChannels = filteredChannels.filter(channel => channel.group === category);
+            // Parse extended attributes
+            const attributes = {};
+            const attrMatches = line.match(/([a-zA-Z-]+)="([^"]*)"/g);
+            if (attrMatches) {
+                attrMatches.forEach(attr => {
+                    const [key, value] = attr.split('=');
+                    attributes[key.toLowerCase()] = value.replace(/"/g, '');
+                });
             }
 
-            const metas = filteredChannels.map(channel => {
-                const meta = {
-                    id: channel.id,
-                    type: 'tv',
-                    name: channel.name,
-                    poster: channel.logo,
-                    posterShape: 'square',
-                    background: channel.logo,
-                    logo: channel.logo
+            // Extract channel name
+            const nameMatch = line.match(/,(.+)$/);
+            if (nameMatch) {
+                currentChannel.name = nameMatch[1].trim();
+            }
+
+            // Set channel properties from attributes
+            currentChannel.id = attributes['tvg-id'] || currentChannel.name;
+            currentChannel.logo = attributes['tvg-logo'] || '';
+            currentChannel.group = attributes['group-title'] || '';
+
+        } else if (line.startsWith('#KODIPROP:')) {
+            // Handle DRM properties
+            if (!currentChannel.drm) {
+                currentChannel.drm = {
+                    inputstreamAddon: '',
+                    manifestType: '',
+                    licenseType: '',
+                    licenseKey: '',
+                    headers: {}
                 };
+            }
 
-                if (epgData && epgData.has(channel.epgId)) {
-                    const programs = epgData.get(channel.epgId);
-                    const currentProgram = programs.find(program => {
-                        const now = new Date();
-                        const start = new Date(program.start);
-                        const stop = new Date(program.stop);
-                        return now >= start && now <= stop;
-                    });
-
-                    if (currentProgram) {
-                        meta.description = `Now: ${currentProgram.title}\n${currentProgram.desc || ''}`;
-                    }
+            const propMatch = line.replace('#KODIPROP:', '').split('=');
+            if (propMatch.length === 2) {
+                const [key, value] = propMatch;
+                switch (key.toLowerCase()) {
+                    case 'inputstreamaddon':
+                        currentChannel.drm.inputstreamAddon = value;
+                        break;
+                    case 'inputstream.adaptive.manifest_type':
+                        currentChannel.drm.manifestType = value;
+                        break;
+                    case 'inputstream.adaptive.license_type':
+                        currentChannel.drm.licenseType = value;
+                        break;
+                    case 'inputstream.adaptive.license_key':
+                        currentChannel.drm.licenseKey = value;
+                        break;
+                    default:
+                        currentChannel.drm.headers[key] = value;
+                }
+            }
+        } else if (line.startsWith('http') && currentChannel) {
+            currentChannel.url = line;
+            
+            if (currentChannel.name && currentChannel.url) {
+                // Generate a unique ID if none exists
+                if (!currentChannel.id) {
+                    currentChannel.id = Buffer.from(currentChannel.url).toString('base64').replace(/=/g, '');
+                }
+                
+                // Remove empty DRM object if no properties were set
+                if (currentChannel.drm && 
+                    !currentChannel.drm.inputstreamAddon && 
+                    !currentChannel.drm.manifestType && 
+                    !currentChannel.drm.licenseType && 
+                    !currentChannel.drm.licenseKey && 
+                    Object.keys(currentChannel.drm.headers).length === 0) {
+                    currentChannel.drm = null;
                 }
 
-                return meta;
-            });
-
-            return Promise.resolve({ metas });
-        }
-        return Promise.resolve({ metas: [] });
-    });
-
-    builder.defineStreamHandler(({ type, id }) => {
-        if (type === 'tv') {
-            const channels = userChannels.get(userId) || [];
-            const channel = channels.find(c => c.id === id);
-            if (!channel) return Promise.resolve({ streams: [] });
-
-            const stream = {
-                name: channel.name,
-                url: channel.url,
-                description: `${channel.name} - ${channel.group}`
-            };
-
-            if (channel.inputStream.manifestType === 'dash') {
-                stream.behaviorHints = {
-                    bingeGroup: `iptv-${channel.group}`,
-                    notWebReady: true
-                };
+                channels.push(currentChannel);
+                console.log('Parsed channel:', JSON.stringify(currentChannel, null, 2));
             }
-
-            if (channel.drmConfig && channel.inputStream.licenseType === 'org.w3.clearkey') {
-                stream.behaviorHints = {
-                    ...stream.behaviorHints,
-                    drmConfig: {
-                        type: 'ClearKey',
-                        licenseKey: channel.inputStream.licenseKey,
-                        keyId: channel.drmConfig.keyId,
-                        key: channel.drmConfig.key,
-                        properties: channel.properties
-                    }
-                };
-            }
-
-            return Promise.resolve({ streams: [stream] });
+            
+            currentChannel = null;
         }
-        return Promise.resolve({ streams: [] });
-    });
-
-    return builder;
-}
-
-// Serve the addon
-app.get('/*', (req, res) => {
-    const userId = req.query.userId;
-    if (!userId || !userConfigs.has(userId)) {
-        // If no userId, serve the configuration page
-        if (req.path === '/') {
-            res.sendFile(path.join(__dirname, 'public', 'index.html'));
-            return;
-        }
-        res.status(404).send({ error: 'Invalid configuration' });
-        return;
     }
 
-    userLastAccess.set(userId, Date.now());
-    const builder = getAddonBuilder(userId);
-    
-    serveHTTP(builder.getInterface(), { server: req, res });
+    console.log(`Parsed ${channels.length} channels`);
+    return channels;
+}
+
+
+// Manifest endpoint
+app.get(['/:userConf/manifest.json'], async (req, res) => {
+    const { userConf } = req.params;
+
+    try {
+        const parsedConfig = parseConfig(userConf);
+        if (!parsedConfig) {
+            return res.status(400).json({ error: 'Invalid configuration' });
+        }
+
+        const userId = generateUserId(parsedConfig);
+
+        res.json({
+            id: `org.stremio.iptv.${userId}`,
+            version: "1.0.0",
+            name: parsedConfig.name || "IPTV Channels",
+            description: parsedConfig.description || "Watch IPTV channels in Stremio",
+            resources: ["catalog", "meta", "stream"],
+            types: ["tv"],
+            catalogs: [{
+                type: "tv",
+                id: "iptv_catalog",
+                name: parsedConfig.name || "IPTV Channels"
+            }],
+            behaviorHints: {
+                configurable: true,
+                configurationRequired: false
+            }
+        });
+    } catch (error) {
+        console.error('Manifest generation error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
 });
 
-const port = process.env.PORT || 7000;
-app.listen(port, () => {
-    console.log(`Addon running at http://localhost:${port}`);
+// Catalog endpoint
+app.get(['/:userConf/catalog/tv/iptv_catalog.json'], async (req, res) => {
+    const { userConf } = req.params;
+    
+    if (process.env.DEBUG) {
+        logger.info('catalog', 'Starting catalog request', { userConf });
+    }
+
+    try {
+        const parsedConfig = parseConfig(userConf);
+        if (!parsedConfig) {
+            if (process.env.DEBUG) {
+                logger.error('catalog', 'Invalid configuration', { userConf });
+            }
+            return res.status(400).json({ error: 'Invalid configuration' });
+        }
+
+        const userId = generateUserId(parsedConfig);
+        if (process.env.DEBUG) {
+            logger.info('catalog', 'Generated userId', { userId });
+        }
+
+        const { data, error } = await supabase
+            .from('channels')
+            .select('channels')
+            .eq('user_id', userId)
+            .single();
+
+        if (error) {
+            if (process.env.DEBUG) {
+                logger.error('catalog', 'Supabase query failed', error);
+            }
+            return res.json({ metas: [] });
+        }
+
+        const metas = (data.channels || []).map(channel => ({
+            id: `iptv_${channel.id || channel.name}`,
+            type: 'tv',
+            name: channel.name,
+            poster: channel.logo || '',
+            description: channel.group || '',
+        }));
+
+        if (process.env.DEBUG) {
+            logger.info('catalog', `Generated ${metas.length} channel metas`, {
+                firstChannel: metas[0],
+                lastChannel: metas[metas.length - 1]
+            });
+        }
+
+        res.json({ 
+            metas,
+            type: 'tv',
+            id: 'iptv_catalog' 
+        });
+    } catch (error) {
+        if (process.env.DEBUG) {
+            logger.error('catalog', 'Catalog generation error', error);
+        }
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Stream endpoint
+app.get(['/:userConf/stream/tv/:id.json'], async (req, res) => {
+   const { userConf, id } = req.params;
+   if (process.env.DEBUG) {
+       logger.info('stream', 'Starting stream request', { userConf, id });
+   }
+
+   try {
+       const parsedConfig = parseConfig(userConf);
+       if (!parsedConfig) {
+           if (process.env.DEBUG) {
+               logger.error('stream', 'Invalid configuration', { userConf });
+           }
+           return res.status(400).json({ error: 'Invalid configuration' });
+       }
+
+       const userId = generateUserId(parsedConfig);
+       if (process.env.DEBUG) {
+           logger.info('stream', 'Generated userId', { userId });
+       }
+
+       const { data, error } = await supabase
+           .from('channels')
+           .select('channels')
+           .eq('user_id', userId)
+           .single();
+
+       if (error) {
+           if (process.env.DEBUG) {
+               logger.error('stream', 'Supabase query failed', error);
+           }
+           return res.json({ streams: [] });
+       }
+
+       const channel = (data.channels || []).find(c => 
+           `iptv_${c.id || c.name}` === id
+       );
+
+       if (!channel) {
+           if (process.env.DEBUG) {
+               logger.warn('stream', 'Channel not found', { id });
+           }
+           return res.json({ streams: [] });
+       }
+
+       if (process.env.DEBUG) {
+           logger.info('stream', 'Found channel', { 
+               channelName: channel.name,
+               channelId: channel.id || channel.name,
+               url: channel.url,
+               hasDRM: !!channel.drm,
+               urlType: channel.url.includes('.mpd') ? 'DASH' : 
+                       channel.url.includes('.m3u8') ? 'HLS' : 'Other'
+           });
+       }
+
+       // Determine stream type
+       const isDASH = channel.url.toLowerCase().includes('.mpd');
+       const isHLS = channel.url.toLowerCase().includes('.m3u8');
+
+       // Stream object to be returned
+       const stream = {
+           url: channel.url,
+           name: channel.name
+       };
+
+       // Special handling for DASH streams with DRM
+       if (isDASH && channel.drm) {
+           // Validate DRM configuration
+           if (!channel.drm.licenseKey) {
+               if (process.env.DEBUG) {
+                   logger.error('stream', 'Invalid DRM configuration - missing license key', { 
+                       channelName: channel.name 
+                   });
+               }
+               return res.json({ streams: [] });
+           }
+		   
+		   // Prepare MediaFlow proxy URL
+			const [keyId, key] = channel.drm.licenseKey.split(':');
+			const mediaflowProxyUrl = `${process.env.MEDIAFLOW_SERVER_URL}/proxy/mpd/manifest.m3u8?d=${encodeURIComponent(channel.url)}&key_id=${keyId}&key=${key}&api_password=${process.env.MEDIAFLOW_API_PASSWORD}`;
+
+           // Update stream URL to MediaFlow HLS proxy
+           stream.url = mediaflowProxyUrl;
+
+           // Set behavior hints for HLS
+           stream.behaviorHints = {
+               notWebReady: true,
+               playerType: "hls"
+           };
+
+           if (process.env.DEBUG) {
+               logger.info('stream', 'Converted DASH DRM to HLS proxy', {
+                   originalUrl: channel.url,
+                   proxyUrl: stream.url,
+                   keyIdPresent: !!keyId
+               });
+           }
+       } 
+       // Handle non-DRM or HLS streams
+       else {
+           stream.behaviorHints = {
+               notWebReady: true,
+               playerType: isDASH ? "mpegdash" : (isHLS ? "hls" : "other")
+           };
+           
+           if (process.env.DEBUG) {
+               logger.info('stream', 'Prepared stream', {
+                   streamType: stream.behaviorHints.playerType
+               });
+           }
+       }
+
+       if (process.env.DEBUG) {
+           logger.info('stream', 'Generated final stream response', { 
+               streamUrl: stream.url,
+               streamName: stream.name,
+               hasBehaviorHints: !!stream.behaviorHints
+           });
+       }
+
+       res.json({
+           streams: [stream]
+       });
+   } catch (error) {
+       if (process.env.DEBUG) {
+           logger.error('stream', 'Stream generation error', {
+               error: error.message,
+               stack: error.stack
+           });
+       }
+       res.status(500).json({ error: 'Internal server error' });
+   }
+});
+
+// Meta endpoint
+app.get(['/:userConf/meta/tv/:id.json'], async (req, res) => {
+    const { userConf, id } = req.params;
+    
+    if (process.env.DEBUG) {
+        logger.info('meta', 'Starting meta request', { userConf, id });
+    }
+
+    try {
+        const parsedConfig = parseConfig(userConf);
+        if (!parsedConfig) {
+            if (process.env.DEBUG) {
+                logger.error('meta', 'Invalid configuration', { userConf });
+            }
+            return res.status(400).json({ error: 'Invalid configuration' });
+        }
+
+        const userId = generateUserId(parsedConfig);
+        if (process.env.DEBUG) {
+            logger.info('meta', 'Generated userId', { userId });
+        }
+
+        const { data, error } = await supabase
+            .from('channels')
+            .select('channels')
+            .eq('user_id', userId)
+            .single();
+            
+        if (error) {
+            if (process.env.DEBUG) {
+                logger.error('meta', 'Supabase query failed', error);
+            }
+            return res.json({ meta: null });
+        }
+
+        const channelId = id.replace('iptv_', '');
+        const channel = (data.channels || []).find(c => 
+            (c.id || c.name) === channelId
+        );
+        
+        if (!channel) {
+            if (process.env.DEBUG) {
+                logger.warn('meta', 'Channel not found', { channelId });
+            }
+            return res.json({ meta: null });
+        }
+
+        if (process.env.DEBUG) {
+            logger.info('meta', 'Found channel', { 
+                channelName: channel.name,
+                channelId: channel.id 
+            });
+        }
+
+        const meta = {
+            id: `iptv_${channel.id || channel.name}`,
+            type: 'tv',
+            name: channel.name,
+            poster: channel.logo || '',
+            description: channel.group || '',
+            genres: [channel.group || 'TV'],
+            posterShape: 'landscape'
+        };
+
+        if (process.env.DEBUG) {
+            logger.info('meta', 'Generated meta response', meta);
+        }
+
+        res.json({ meta });
+    } catch (error) {
+        if (process.env.DEBUG) {
+            logger.error('meta', 'Meta generation error', error);
+        }
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Root handler - serve HTML for browser, manifest for Stremio
+app.get('/', (req, res) => {
+    const userAgent = req.headers['user-agent'] || '';
+    const isStremio = userAgent.includes('Stremio');
+
+    if (isStremio) {
+        res.json({
+            id: "org.stremio.iptv",
+            version: "1.0.0",
+            name: "IPTV Addon",
+            description: "Watch IPTV channels in Stremio",
+            resources: ["catalog", "stream"],
+            types: ["tv"],
+            catalogs: [{
+                type: "tv",
+                id: "iptv_catalog",
+                name: "IPTV Channels"
+            }],
+            behaviorHints: {
+                configurable: true,
+                configurationRequired: true
+            }
+        });
+    } else {
+        res.sendFile(path.join(__dirname, 'public', 'index.html'));
+    }
 });
 
 export default app;
